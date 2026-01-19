@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <ctype.h>
 #include <signal.h>
 #include <unistd.h>
@@ -23,7 +24,7 @@
 // My mingw installation does not load inet_pton definition for some reason
 WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pAddr);
 
-#define GOODBYEDPI_VERSION "v0.2.3"
+#define GOODBYEDPI_VERSION "v0.2.3rc3"
 
 #define die() do { sleep(20); exit(EXIT_FAILURE); } while (0)
 
@@ -83,7 +84,7 @@ WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pA
         "and udp.Payload[0] >= 0xC0 and udp.Payload32[1b] == 0x01"
 #define FILTER_PASSIVE_STRING_TEMPLATE "inbound and ip and tcp and " \
         "!impostor and !loopback and " \
-        "((ip.Id <= 0xF and ip.Id >= 0x0) " IPID_TEMPLATE ") and " \
+        "(true " IPID_TEMPLATE ") and " \
         "(tcp.SrcPort == 443 or tcp.SrcPort == 80) and tcp.Rst and " \
         DIVERT_NO_LOCALNETSv4_SRC
 
@@ -134,6 +135,18 @@ WINSOCK_API_LINKAGE INT WSAAPI inet_pton(INT Family, LPCSTR pStringBuf, PVOID pA
              ttl_of_fake_packet, do_wrong_chksum, do_wrong_seq); \
 } while (0)
 
+enum ERROR_CODE{
+    ERROR_DEFAULT = 1,
+    ERROR_PORT_BOUNDS,
+    ERROR_DNS_V4_ADDR,
+    ERROR_DNS_V6_ADDR,
+    ERROR_DNS_V4_PORT,
+    ERROR_DNS_V6_PORT,
+    ERROR_BLACKLIST_LOAD,
+    ERROR_AUTOTTL,
+    ERROR_ATOUSI,
+    ERROR_AUTOB
+};
 
 static int running_from_service = 0;
 static int exiting = 0;
@@ -175,6 +188,11 @@ static struct option long_options[] = {
     {"native-frag", no_argument,       0,  '*' },
     {"reverse-frag",no_argument,       0,  '(' },
     {"max-payload", optional_argument, 0,  '|' },
+    {"fake-from-hex", required_argument, 0,  'u' },
+    {"fake-with-sni", required_argument, 0,  '}' },
+    {"fake-gen",    required_argument, 0,  'j' },
+    {"fake-resend", required_argument, 0,  't' },
+    {"debug-exit",  optional_argument, 0,  'x' },
     {0,             0,                 0,   0  }
 };
 
@@ -270,7 +288,7 @@ unsigned short int atousi(const char *str, const char *msg) {
 
     if(res > limitValue) {
         puts(msg);
-        exit(EXIT_FAILURE);
+        exit(ERROR_ATOUSI);
     }
     return (unsigned short int)res;
 }
@@ -283,7 +301,7 @@ BYTE atoub(const char *str, const char *msg) {
 
     if(res > limitValue) {
         puts(msg);
-        exit(EXIT_FAILURE);
+        exit(ERROR_AUTOB);
     }
     return (BYTE)res;
 }
@@ -309,7 +327,7 @@ static HANDLE init(char *filter, UINT64 flags) {
                "Please unload it with the following commands ran as administrator:\n\n"
                "sc stop windivert\n"
                "sc delete windivert\n"
-               "sc stop windivert14"
+               "sc stop windivert14\n"
                "sc delete windivert14\n");
     else if (errorcode == 1275)
         printf("This error occurs for various reasons, including:\n"
@@ -565,6 +583,7 @@ int main(int argc, char *argv[]) {
         ipv4_tcp, ipv4_tcp_data, ipv4_udp_data,
         ipv6_tcp, ipv6_tcp_data, ipv6_udp_data
     } packet_type;
+    bool debug_exit = false;
     int i, should_reinject, should_recalc_checksum = 0;
     int sni_ok = 0;
     int opt;
@@ -768,7 +787,7 @@ int main(int argc, char *argv[]) {
                 i = atoi(optarg);
                 if (i <= 0 || i > 65535) {
                     printf("Port parameter error!\n");
-                    exit(EXIT_FAILURE);
+                    exit(ERROR_PORT_BOUNDS);
                 }
                 if (i != 80 && i != 443)
                     add_filter_str(IPPROTO_TCP, i);
@@ -787,14 +806,14 @@ int main(int argc, char *argv[]) {
                     do_dnsv4_redirect = 1;
                     if (inet_pton(AF_INET, optarg, &dnsv4_addr) != 1) {
                         puts("DNS address parameter error!");
-                        exit(EXIT_FAILURE);
+                        exit(ERROR_DNS_V4_ADDR);
                     }
                     add_filter_str(IPPROTO_UDP, 53);
                     flush_dns_cache();
                     break;
                 }
                 puts("DNS address parameter error!");
-                exit(EXIT_FAILURE);
+                exit(ERROR_DNS_V4_ADDR);
                 break;
             case '!': // --dnsv6-addr
                 if ((inet_pton(AF_INET6, optarg, dns_temp_addr.s6_addr) == 1) &&
@@ -803,21 +822,21 @@ int main(int argc, char *argv[]) {
                     do_dnsv6_redirect = 1;
                     if (inet_pton(AF_INET6, optarg, dnsv6_addr.s6_addr) != 1) {
                         puts("DNS address parameter error!");
-                        exit(EXIT_FAILURE);
+                        exit(ERROR_DNS_V6_ADDR);
                     }
                     add_filter_str(IPPROTO_UDP, 53);
                     flush_dns_cache();
                     break;
                 }
                 puts("DNS address parameter error!");
-                exit(EXIT_FAILURE);
+                exit(ERROR_DNS_V6_ADDR);
                 break;
             case 'g': // --dns-port
                 if (!do_dnsv4_redirect) {
                     puts("--dns-port should be used with --dns-addr!\n"
                         "Make sure you use --dns-addr and pass it before "
                         "--dns-port");
-                    exit(EXIT_FAILURE);
+                    exit(ERROR_DNS_V4_PORT);
                 }
                 dnsv4_port = atousi(optarg, "DNS port parameter error!");
                 if (dnsv4_port != 53) {
@@ -830,7 +849,7 @@ int main(int argc, char *argv[]) {
                     puts("--dnsv6-port should be used with --dnsv6-addr!\n"
                         "Make sure you use --dnsv6-addr and pass it before "
                         "--dnsv6-port");
-                    exit(EXIT_FAILURE);
+                    exit(ERROR_DNS_V6_PORT);
                 }
                 dnsv6_port = atousi(optarg, "DNS port parameter error!");
                 if (dnsv6_port != 53) {
@@ -846,7 +865,7 @@ int main(int argc, char *argv[]) {
                 do_blacklist = 1;
                 if (!blackwhitelist_load_list(optarg)) {
                     printf("Can't load blacklist from file!\n");
-                    exit(EXIT_FAILURE);
+                    exit(ERROR_BLACKLIST_LOAD);
                 }
                 break;
             case ']': // --allow-no-sni
@@ -880,13 +899,13 @@ int main(int argc, char *argv[]) {
                         autottl_current = strtok(NULL, "-");
                         if (!autottl_current) {
                             puts("Set Auto TTL parameter error!");
-                            exit(EXIT_FAILURE);
+                            exit(ERROR_AUTOTTL);
                         }
                         auto_ttl_2 = atoub(autottl_current, "Set Auto TTL parameter error!");
                         autottl_current = strtok(NULL, "-");
                         if (!autottl_current) {
                             puts("Set Auto TTL parameter error!");
-                            exit(EXIT_FAILURE);
+                            exit(ERROR_AUTOTTL);
                         }
                         auto_ttl_max = atoub(autottl_current, "Set Auto TTL parameter error!");
                     }
@@ -924,6 +943,33 @@ int main(int argc, char *argv[]) {
                     max_payload_size = atousi(optarg, "Max payload size parameter error!");
                 else
                     max_payload_size = 1200;
+                break;
+            case 'u': // --fake-from-hex
+                if (fake_load_from_hex(optarg)) {
+                    printf("WARNING: bad fake HEX value %s\n", optarg);
+                }
+                break;
+            case '}': // --fake-with-sni
+                if (fake_load_from_sni(optarg)) {
+                    printf("WARNING: bad domain name for SNI: %s\n", optarg);
+                }
+                break;
+            case 'j': // --fake-gen
+                if (fake_load_random(atoub(optarg, "Fake generator parameter error!"), 200)) {
+                    puts("WARNING: fake generator has failed!");
+                }
+                break;
+            case 't': // --fake-resend
+                fakes_resend = atoub(optarg, "Fake resend parameter error!");
+                if (fakes_resend == 1)
+                    puts("WARNING: fake-resend is 1, no resending is in place!");
+                else if (!fakes_resend)
+                    puts("WARNING: fake-resend is 0, fake packet mode is disabled!");
+                else if (fakes_resend > 100)
+                    puts("WARNING: fake-resend value is a little too high, don't you think?");
+                break;
+            case 'x': // --debug-exit
+                debug_exit = true;
                 break;
             default:
                 puts("Usage: goodbyedpi.exe [OPTION...]\n"
@@ -970,6 +1016,17 @@ int main(int argc, char *argv[]) {
                 " --reverse-frag           fragment (split) the packets just as --native-frag, but send them in the\n"
                 "                          reversed order. Works with the websites which could not handle segmented\n"
                 "                          HTTPS TLS ClientHello (because they receive the TCP flow \"combined\").\n"
+                " --fake-from-hex <value>  Load fake packets for Fake Request Mode from HEX values (like 1234abcDEF).\n"
+                "                          This option can be supplied multiple times, in this case each fake packet\n"
+                "                          would be sent on every request in the command line argument order.\n"
+                " --fake-with-sni <value>  Generate fake packets for Fake Request Mode with given SNI domain name.\n"
+                "                          The packets mimic Mozilla Firefox 130 TLS ClientHello packet\n"
+                "                          (with random generated fake SessionID, key shares and ECH grease).\n"
+                "                          Can be supplied multiple times for multiple fake packets.\n"
+                " --fake-gen <value>       Generate random-filled fake packets for Fake Request Mode, value of them\n"
+                "                          (up to 30).\n"
+                " --fake-resend <value>    Send each fake packet value number of times.\n"
+                "                          Default: 1 (send each packet once).\n"
                 " --max-payload [value]    packets with TCP payload data more than [value] won't be processed.\n"
                 "                          Use this option to reduce CPU usage by skipping huge amount of data\n"
                 "                          (like file transfers) in already established sessions.\n"
@@ -990,7 +1047,7 @@ int main(int argc, char *argv[]) {
                 " -9          -f 2 -e 2 --wrong-seq --wrong-chksum --reverse-frag --max-payload -q (this is the default)\n\n"
                 "Note: combination of --wrong-seq and --wrong-chksum generates two different fake packets.\n"
                 );
-                exit(EXIT_FAILURE);
+                exit(ERROR_DEFAULT);
         }
     }
 
@@ -1029,7 +1086,9 @@ int main(int argc, char *argv[]) {
            "Fake requests, TTL: %s (fixed: %hu, auto: %hu-%hu-%hu, min distance: %hu)\n"  /* 17 */
            "Fake requests, wrong checksum: %d\n"    /* 18 */
            "Fake requests, wrong SEQ/ACK: %d\n"     /* 19 */
-           "Max payload size: %hu\n",               /* 20 */
+           "Fake requests, custom payloads: %d\n"   /* 20 */
+           "Fake requests, resend: %d\n"            /* 21 */
+           "Max payload size: %hu\n",               /* 22 */
            do_passivedpi, do_block_quic,                          /* 1 */
            (do_fragment_http ? http_fragment_size : 0),           /* 2 */
            (do_fragment_http_persistent ? http_fragment_size : 0),/* 3 */
@@ -1051,7 +1110,9 @@ int main(int argc, char *argv[]) {
                do_auto_ttl ? auto_ttl_max : 0, ttl_min_nhops,
            do_wrong_chksum, /* 18 */
            do_wrong_seq,    /* 19 */
-           max_payload_size /* 20 */
+           fakes_count,     /* 20 */
+           fakes_resend,    /* 21 */
+           max_payload_size /* 22 */
           );
 
     if (do_fragment_http && http_fragment_size > 2 && !do_native_frag) {
@@ -1104,7 +1165,10 @@ int main(int argc, char *argv[]) {
         if (filters[i] == NULL)
             die();
     }
-
+    if (debug_exit) {
+        printf("Debug Exit\n");
+        exit(EXIT_SUCCESS);
+    }
     printf("Filter activated, GoodbyeDPI is now running!\n");
     signal(SIGINT, sigint_handler);
 
